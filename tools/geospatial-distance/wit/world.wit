@@ -1,0 +1,5 @@
+package wasmcp:geospatial-distance@0.1.0;
+
+world geospatial-distance {
+    export wasmcp:protocol/tools@0.1.0-beta.2;
+}

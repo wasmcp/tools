@@ -1,0 +1,195 @@
+name: Build and Publish Components
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      component:
+        description: 'Specific component to publish (leave empty for all)'
+        required: false
+        type: string
+      version:
+        description: 'Version to publish (leave empty to use git tag or default)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  NAMESPACE: wasmcp
+
+jobs:
+  detect-changes:
+    name: Detect Changed Components
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.detect.outputs.components }}
+      all-components: ${{ steps.all.outputs.components }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get all components
+        id: all
+        run: |
+          COMPONENTS=$(ls -d */ | grep -v "scripts" | grep -v ".github" | sed 's/\///' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "components=$COMPONENTS" >> $GITHUB_OUTPUT
+
+      - name: Detect changed components
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.component }}" ]; then
+            # Manual trigger with specific component
+            echo "components=[\"${{ github.event.inputs.component }}\"]" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Tag push - build all components
+            COMPONENTS=$(ls -d */ | grep -v "scripts" | grep -v ".github" | sed 's/\///' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "components=$COMPONENTS" >> $GITHUB_OUTPUT
+          else
+            # Detect changes in PR or regular push
+            CHANGED_DIRS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -E '^[^/]+/' | cut -d'/' -f1 | sort -u | grep -v "scripts" | grep -v ".github" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            if [ "$CHANGED_DIRS" == "[]" ] || [ -z "$CHANGED_DIRS" ]; then
+              echo "components=[]" >> $GITHUB_OUTPUT
+            else
+              echo "components=$CHANGED_DIRS" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  build:
+    name: Build Components
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.detect-changes.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.component }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build component
+        run: |
+          cd ${{ matrix.component }}
+          cargo build --target wasm32-wasip2 --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}-wasm
+          path: ${{ matrix.component }}/target/wasm32-wasip2/release/${{ matrix.component }}.wasm
+          retention-days: 7
+
+  publish:
+    name: Publish to OCI Registry
+    needs: [detect-changes, build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        component: ${{ fromJson(needs.detect-changes.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.component }}-wasm
+          path: ${{ matrix.component }}/target/wasm32-wasip2/release/
+
+      - name: Install wkg
+        run: cargo install wkg
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"  # Remove 'v' prefix if present
+          else
+            VERSION="0.1.0-dev.$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure wkg registry
+        run: |
+          wkg config set-registry ${{ env.NAMESPACE }} ${{ env.REGISTRY }}
+
+      - name: Publish component
+        run: |
+          cd ${{ matrix.component }}
+          wkg publish \
+            --package "${{ env.NAMESPACE }}:${{ matrix.component }}@${{ steps.version.outputs.version }}" \
+            target/wasm32-wasip2/release/${{ matrix.component }}.wasm
+
+      - name: Create release summary
+        run: |
+          echo "## Published Component" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Component**: ${{ matrix.component }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **OCI Reference**: \`${{ env.NAMESPACE }}:${{ matrix.component }}@${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Usage" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "wasmcp compose ${{ env.NAMESPACE }}:${{ matrix.component }}@${{ steps.version.outputs.version }} ..." >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  test-build:
+    name: Test Build All Components
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-all-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test build all components
+        run: make test-build

@@ -1,0 +1,5 @@
+package wasmcp:geospatial-bearing@0.1.0;
+
+world geospatial-bearing {
+    export wasmcp:protocol/tools@0.1.0-beta.2;
+}

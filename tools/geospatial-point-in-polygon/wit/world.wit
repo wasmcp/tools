@@ -1,0 +1,5 @@
+package wasmcp:geospatial-point-in-polygon@0.1.0;
+
+world geospatial-point-in-polygon {
+    export wasmcp:protocol/tools@0.1.0-beta.2;
+}
